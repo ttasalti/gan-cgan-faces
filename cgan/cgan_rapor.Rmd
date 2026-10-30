@@ -1,0 +1,641 @@
+---
+title: "CGAN_Rapor"
+author: "Mustafa Öngün, Tarık Tuna Taşaltı, Büşra Sulak"
+date: "2025-01-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Verinin Hazırlanması
+
+```{r, include=FALSE}
+library(reticulate)
+```
+
+Kaggle'dan alınan Faces veriseti kullanılarak CGAN uygulaması Python programlama dilinde yapılmıştır. Verinin ön hazırlığı, işlenmesi ve conditional GAN fonksiyonlarının çalıştırılabilmesi için gerekli olan Python paketleri indirilmiştir.
+
+```{python, eval=FALSE}
+import os
+import random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.layers import (
+    Dense, Reshape, UpSampling2D, Conv2D, BatchNormalization, Activation, Flatten,
+    LeakyReLU, Dropout, Concatenate, Input
+)
+from tensorflow.keras.models import Sequential, Model
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+import seaborn as sns
+```
+
+Veriler "labels.csv" dosyasından içe aktarılmıştır. Fotoğraflardaki insan duygularının her biri için farklı etiketli dosyalardın bulunduğu dosya yolları tanımlanmıştır. Her bir etiket one hot encoding yöntemiyle kategorik değişken haline getirilmiştir.
+
+```{python, eval=FALSE}
+data_path = "./DATA2/"
+labels_path = os.path.join(data_path, "labels.csv")
+
+labels_df = pd.read_csv(labels_path)
+file_paths = labels_df['pth'].values
+labels = labels_df['label'].values
+
+label_encoder = LabelEncoder()
+encoded_labels = label_encoder.fit_transform(labels)
+one_hot_labels = to_categorical(encoded_labels)
+```
+
+Dosyalardaki fotoğrafların conditional GAN uygulamasına uygun hale getirilebilecek şekilde img değişkenine üç kanallı ve 48*48 boyutunda atanması işlemini yapacak ve her bir fotoğrafın etiketini label değişkeni şeklinde döndürecek olan load_image fonksiyonu tanımlanmıştır. img -1 ile 1 arasında normalize edilmiştir.
+
+```{python, eval=FALSE}
+def load_image(file_path, label):
+    full_path = tf.strings.join([data_path, file_path], separator='/')
+    img = tf.io.read_file(full_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, [96, 96])  # Change to 48x48 resolution
+    img = (img / 127.5) - 1.0  # Normalize to [-1, 1]
+    return img, label
+```
+
+Verileri işlemek için load_image fonksiyonu ve tensorflow paketi kullanılarak veri setleri kurulmuştur.
+
+```{python, eval=FALSE}
+dataset = tf.data.Dataset.from_tensor_slices((file_paths, one_hot_labels))
+dataset = dataset.map(lambda x, y: load_image(x, y), num_parallel_calls=tf.data.AUTOTUNE).batch(256)
+```
+
+## Generator Fonksiyonu
+
+
+`build_generator` fonksiyonunda CGAN için **generator** modeli tanımlanmıştır. **Generator modeli**, rastgele gürültü ve koşullu etiket bilgilerini kullanarak, belirtilen boyutlarda yeni görüntüler üretmektedir. 
+
+#### **Girdi Verileri**
+- **`latent_dim`**: Rastgele gürültü vektörünün boyutunu ifade eder.
+- **`num_classes`**: Koşullu etiketlerin one-hot kodlanmış temsilinin boyutunu ifade eder.
+
+---
+
+#### **Fonksiyonun Çalışma Adımları**
+
+##### **1. Birleştirme**
+- İlk olarak `Concatenate` fonksiyonu ile gürültü vektörü (`noise_input`) ve etiket girdisi (`label_input`) birleştirilir.
+
+---
+
+##### **2. Yoğun Katman ve Yeniden Şekillendirme**
+- Birleştirilen girişler bir **Dense** katmandan geçirilir.
+- Çıkış, 12x12 boyutunda bir özellik haritasına yeniden şekillendirilir.
+
+---
+
+##### **3. Örnekleme (UpSampling)**
+- Görüntü boyutları sırasıyla:
+  - **12x12'den 24x24'e**,
+  - **24x24'ten 48x48'e**,
+  - **48x48'den 96x96'ya** çıkarılır.
+
+---
+
+##### **4. Konvolüsyon ve Aktivasyon**
+- Her örnekleme adımında **konvolüsyon katmanları** uygulanır.
+- **ReLU** aktivasyonu kullanılarak görüntü özellikleri öğrenilir.
+
+---
+
+##### **5. Son Katman**
+- Son konvolüsyon katmanından sonra **tanh** aktivasyonu kullanılarak, RGB renk kanallarına (3 kanal) sahip bir çıktı üretilir.
+
+---
+
+#### **Modelin Tanımlanması**
+- TensorFlow paketinin **Model** fonksiyonu kullanılarak, oluşturulmuş model bir "generator" olarak tanımlanmıştır.
+
+```{python, eval=FALSE}
+def build_generator(latent_dim, num_classes):
+    noise_input = Input(shape=(latent_dim,))
+    label_input = Input(shape=(num_classes,))
+    x = Concatenate()([noise_input, label_input])
+    x = Dense(12 * 12 * 64, activation="relu")(x)  
+    x = Reshape((12, 12, 64))(x)  # Daha büyük feature map
+    x = UpSampling2D()(x)  # 12x12 -> 24x24
+    x = Conv2D(64, kernel_size=3, padding="same")(x)  # Daha fazla filtre
+    x = BatchNormalization(momentum=0.8)(x)
+    x = Activation("relu")(x)
+    x = UpSampling2D()(x)  # 24x24 -> 48x48
+    x = Conv2D(32, kernel_size=3, padding="same")(x)  # Daha fazla filtre
+    x = BatchNormalization(momentum=0.8)(x)
+    x = Activation("relu")(x)
+    x = UpSampling2D()(x)  # 48x48 -> 96x96
+    x = Conv2D(3, kernel_size=3, padding="same")(x)
+    x = Activation("tanh")(x)
+    return Model([noise_input, label_input], x, name="generator")
+```
+
+## Discriminator Fonksiyonu
+
+`build_discriminator` fonksiyonu, CGAN için discriminator modelini tanımlamaktadır. **Discriminator**, üretilen görüntülerin gerçek veya sahte olduğunu belirlerken aynı zamanda koşullu etiket bilgilerini de dikkate almaktadır. Fonksiyon, girdi değerleri olarak şunları alır:
+
+- **`img_shape`**: Giriş görüntüsünün şekli.
+- **`num_classes`**: Koşullu etiketlerin one-hot kodlanmış temsilinin boyutu.
+
+---
+
+#### **Fonksiyonun İşleyiş Adımları**
+
+##### **1. Girdi ve Etiket İşleme**
+- **Görüntü Girişi (`img_input`)**: Discriminator’a gönderilecek görüntüyü temsil eder.
+- **Etiket Girişi (`label_input`)**: Koşullu etiket girdisi alınır ve bir yoğun (`dense`) katmandan geçirilerek, görüntü boyutlarına uygun bir "etiket gömme (label embedding)" oluşturulur.
+- **Birleştirme (`Concatenate`)**: Gömülü etiket ve görüntü girdisi, kanal ekseni boyunca birleştirilir. Bu sayede model, koşullu bilgilere dayalı değerlendirme yapabilir.
+
+---
+
+##### **2. Konvolüsyon Katmanları**
+- Birden fazla konvolüsyon katmanı uygulanarak, görüntüdeki özellikler çıkarılır.
+- Her konvolüsyon katmanında **LeakyReLU** aktivasyon fonksiyonu kullanılır. Bu, negatif değerleri küçük bir eğimle geçirerek öğrenmeyi hızlandırır.
+- İsteğe bağlı olarak **Dropout** katmanları eklenebilir. Dropout, aşırı öğrenmeyi (**overfitting**) önlemek için faydalıdır.
+
+---
+
+##### **3. Son Katmanlar**
+- Özellik haritası düzleştirilir (**Flatten**).
+- Yoğun bir katman (**Dense**) kullanılarak tek bir çıktı değeri üretilir. Bu değer, görüntünün gerçek (`1`) veya sahte (`0`) olup olmadığını belirlemek için **sigmoid** aktivasyon fonksiyonu ile sınırlanır.
+
+---
+
+#### **Fonksiyonun Çıktısı**
+- Fonksiyonun çıktısı, tek bir olasılık değeridir (0 ile 1 arasında). Bu değer, girdinin gerçek veya sahte olma olasılığını temsil etmektedir.
+
+```{python, eval=FALSE}
+def build_discriminator(img_shape, num_classes):
+    img_input = Input(shape=img_shape)
+    label_input = Input(shape=(num_classes,))
+    label_embedding = Dense(img_shape[0] * img_shape[1] * 3)(label_input)
+    label_embedding = Reshape((img_shape[0], img_shape[1], 3))(label_embedding)
+    x = Concatenate(axis=-1)([img_input, label_embedding])
+    x = Conv2D(64, kernel_size=3, strides=2, padding="same")(x)  # Daha fazla filtre
+    x = LeakyReLU(alpha=0.2)(x)
+    #x = Dropout(0.1)(x)
+    x = Conv2D(128, kernel_size=3, strides=2, padding="same")(x)  # Daha fazla filtre
+    x = LeakyReLU(alpha=0.2)(x)
+    #x = Dropout(0.1)(x)
+    x = Flatten()(x)
+    x = Dense(1, activation="sigmoid")(x)
+    return Model([img_input, label_input], x)
+```
+
+## CGAN Class'ı Oluşturma
+
+Bu sınıf, CGAN modeli için bir TensorFlow Model sınıfı tanımlamasıdır. Hem generator hem de discriminator modelleri kapsamakta ve eğitim sürecini düzenlemektedir. 
+
+#### **Sınıfın Yapılandırıcısı: `__init__`**
+- **`generator`**: CGAN’ın generator modeli. Rastgele latent vektörler ve etiketlerden görüntüler üretir.
+- **`discriminator`**: CGAN’ın discriminator modeli. Görüntülerin gerçek mi sahte mi olduğunu koşullu olarak değerlendirir.
+- **`latent_dim`**: Generator için kullanılan rastgele latent vektörlerin boyutu.
+
+---
+
+#### **Modelin Derlenmesi: `compile`**
+- **`d_optimizer`**: Discriminator için optimizasyon algoritması.
+- **`g_optimizer`**: Generator için optimizasyon algoritması.
+- **`loss_fn`**: Kayıp fonksiyonu (ör. binary cross-entropy).
+- **Eklenen Metrikler**:
+  - `d_loss_metric`: Discriminator kaybını izlemek için.
+  - `g_loss_metric`: Generator kaybını izlemek için.
+  - `d_accuracy_metric`: Discriminator doğruluğunu izlemek için.
+
+```{python, eval=FALSE}
+class ConditionalGAN(tf.keras.Model):
+    def __init__(self, generator, discriminator, latent_dim):
+        super(ConditionalGAN, self).__init__()
+        self.generator = generator
+        self.discriminator = discriminator
+        self.latent_dim = latent_dim
+
+    def compile(self, d_optimizer, g_optimizer, loss_fn):
+        super(ConditionalGAN, self).compile()
+        self.d_optimizer = d_optimizer
+        self.g_optimizer = g_optimizer
+        self.loss_fn = loss_fn
+        self.d_loss_metric = tf.keras.metrics.Mean(name="d_loss")
+        self.g_loss_metric = tf.keras.metrics.Mean(name="g_loss")
+        self.d_accuracy_metric = tf.keras.metrics.Mean(name="d_accuracy")
+```
+
+#### **Eğitim Adımı: `train_step`**
+- **Giriş Verisi**:
+  - `real_images`: Gerçek görüntüler.
+  - `real_labels`: Bu görüntülere karşılık gelen gerçek etiketler.
+  - `batch_size`: Her eğitim adımında işlenecek görüntü sayısı.
+
+- **Sahte Görüntülerin Üretilmesi**:
+  - Rastgele latent vektörler kullanılarak sahte görüntüler üretilir (`fake_images`).
+
+- **Gerçek ve Sahte Görüntülerin Birleştirilmesi**:
+  - Gerçek ve sahte görüntüler ile etiketler birleştirilir (`combined_images`, `combined_labels`).
+  - Gerçek ve sahte görüntüler için hedef etiketler (`1` ve `0`) hazırlanır.
+
+- **Discriminator’ın Eğitilmesi**:
+  - Discriminator, gerçek ve sahte görüntüleri ayırt etmeyi öğrenir.
+  - GradientTape kullanılarak kayıplar hesaplanır ve ağırlıklar güncellenir.
+  - **Discriminator Doğruluğu**: Tahminlerin doğru olma oranı hesaplanır (`d_accuracy`).
+
+- **Generator’ın Eğitilmesi**:
+  - Generator, sahte görüntüleri gerçek gibi gösterecek şekilde eğitilir.
+  - Sahte görüntüler için hedef etiketler `1` olarak belirlenir.
+
+- **Metriklerin Güncellenmesi**:
+  - Discriminator kaybı, generator kaybı ve discriminator doğruluğu güncellenir.
+
+---
+
+#### **Çıktılar**
+- Eğitim adımında izlenen metrikler:
+  - `d_loss`: Discriminator kaybı.
+  - `g_loss`: Generator kaybı.
+  - `d_accuracy`: Discriminator doğruluğu.
+
+---
+
+```{python, eval=FALSE}
+@property
+    def metrics(self):
+        return [self.d_loss_metric, self.g_loss_metric, self.d_accuracy_metric]
+
+    def train_step(self, data):
+        real_images, real_labels = data
+        batch_size = tf.shape(real_images)[0]
+
+        # Generate fake images
+        random_latent_vectors = tf.random.normal(shape=(batch_size, self.latent_dim))
+        fake_images = self.generator([random_latent_vectors, real_labels])
+
+        # Combine real and fake images
+        combined_images = tf.concat([real_images, fake_images], axis=0)
+        combined_labels = tf.concat([real_labels, real_labels], axis=0)
+        labels = tf.concat([
+            tf.ones((batch_size, 1)), tf.zeros((batch_size, 1))
+        ], axis=0)
+
+        # Train discriminator
+        with tf.GradientTape() as tape:
+            predictions = self.discriminator([combined_images, combined_labels])
+            d_loss = self.loss_fn(labels, predictions)
+        grads = tape.gradient(d_loss, self.discriminator.trainable_weights)
+        self.d_optimizer.apply_gradients(
+            zip(grads, self.discriminator.trainable_weights)
+        )
+
+        # Discriminator accuracy
+        d_accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.round(predictions), labels), tf.float32))
+
+        # Train generator
+        misleading_labels = tf.ones((batch_size, 1))
+        with tf.GradientTape() as tape:
+            predictions = self.discriminator([
+                self.generator([random_latent_vectors, real_labels]), real_labels
+            ])
+            g_loss = self.loss_fn(misleading_labels, predictions)
+        grads = tape.gradient(g_loss, self.generator.trainable_weights)
+        self.g_optimizer.apply_gradients(zip(grads, self.generator.trainable_weights))
+
+        # Update metrics
+        self.d_loss_metric.update_state(d_loss)
+        self.g_loss_metric.update_state(g_loss)
+        self.d_accuracy_metric.update_state(d_accuracy)
+        return {
+            "d_loss": self.d_loss_metric.result(),
+            "g_loss": self.g_loss_metric.result(),
+            "d_accuracy": self.d_accuracy_metric.result(),
+        }
+```
+
+### CGAN Modelinin Tanımlanması ve Hyperparametrelerin Belirlenmesi
+
+#### **1. Hiperparametrelerin Tanımlanması**
+- **`latent_dim`**: Rastgele gürültü vektörünün boyutu olarak belirlenmiştir. Bu örnekte `256` olarak atanmıştır.
+- **`num_classes`**: Koşullu etiketlerin sayısını temsil eder. `label_encoder` kullanılarak sınıf sayısı belirlenmiştir.
+
+#### **2. Generator ve Discriminator Modellerinin Tanımlanması**
+- **Generator**: `build_generator` fonksiyonu çağrılarak, rastgele gürültü ve koşullu etiket bilgilerini kullanarak yeni görüntüler üretecek olan generator modeli oluşturulmuştur.
+- **Discriminator**: `build_discriminator` fonksiyonu çağrılarak, gerçek ve sahte görüntüleri koşullu etiket bilgileriyle birlikte değerlendiren discriminator modeli oluşturulmuştur.
+
+#### **3. ConditionalGAN Modelinin Tanımlanması**
+- **`ConditionalGAN` Sınıfı**: 
+  - Generator ve discriminator modelleri kullanılarak bir CGAN modeli oluşturulmuştur.
+  - Model, rastgele gürültü ve koşullu etiket bilgilerini kullanarak gerçekçi görüntüler üretirken, discriminator sahte ve gerçek görüntüleri ayırt etmeyi öğrenir.
+
+#### **4. Modelin Derlenmesi**
+Model, `compile` fonksiyonu ile derlenmiştir. Derleme sırasında şu parametreler kullanılmıştır:
+**`d_optimizer`**: 
+  - Discriminator için `Adam` optimizasyon algoritması atanmıştır.
+  - Öğrenme oranı (**learning_rate**) `5e-5` olarak belirlenmiştir.
+  - **beta_1**: Momentumu kontrol eden hiperparametre olarak `0.5` seçilmiştir.
+**`g_optimizer`**: 
+  - Generator için `Adam` optimizasyon algoritması atanmıştır.
+  - Öğrenme oranı (**learning_rate**) `5e-4` olarak belirlenmiştir.
+  - **beta_1**: Momentumu kontrol eden hiperparametre olarak `0.5` seçilmiştir.
+**`loss_fn`**: 
+  - **`BinaryCrossentropy`** kayıp fonksiyonu atanmıştır. Bu fonksiyon, gerçek ve sahte görüntülerin doğru bir şekilde sınıflandırılması için kullanılır.
+
+
+```{python, eval=FALSE}
+latent_dim = 256
+num_classes = len(label_encoder.classes_)
+generator = build_generator(latent_dim, num_classes)
+discriminator = build_discriminator((96, 96, 3), num_classes)
+
+cgan = ConditionalGAN(generator, discriminator, latent_dim)
+cgan.compile(
+    d_optimizer=tf.keras.optimizers.Adam(learning_rate=5e-5, beta_1=0.5),
+    g_optimizer=tf.keras.optimizers.Adam(learning_rate=5 e-4, beta_1=0.5),
+    loss_fn=tf.keras.losses.BinaryCrossentropy()
+)
+```
+
+### `LossHistoryCallback` ve Kayıp Grafikleri
+
+Eğitim sürecindeki generator ve discriminator modellerinin performansını izlemek ve kayıplarını görselleştirmek için aşağıdaki yapı tanımlanmıştır:
+
+---
+
+#### **1. Kayıp Listelerinin Başlatılması**
+- **`g_loss_history`**: Generator’ın her epoch için kayıp değerlerini saklamak için kullanılan liste.
+- **`d_loss_history`**: Discriminator’ın her epoch için kayıp değerlerini saklamak için kullanılan liste.
+
+---
+
+#### **2. Başlangıçta Grafiklerin Hazırlanması**
+- `matplotlib` kütüphanesi kullanılarak bir grafik oluşturulmuştur:
+  - **X Ekseni (Epoch)**: Eğitim adımını ifade etmektedir.
+  - **Y Ekseni (Loss)**: Generator ve discriminator’ın kayıp değerlerini göstermektedir.
+- Grafik öğeleri:
+  - **`g_line`**: Generator kaybı.
+  - **`d_line`**: Discriminator kaybı.
+- Grafik için ek ayarlar:
+  - Başlık, eksen etiketleri, ızgara ve bir açıklama (legend).
+
+---
+
+#### **3. `LossHistoryCallback` Sınıfı**
+Bu sınıf, TensorFlow’un `Callback` sınıfından türetilmiştir ve eğitim sürecindeki metrikleri izlemek için kullanılmaktadır.
+
+- **`__init__` Fonksiyonu**:
+  - Epoch bazında kayıpları saklamak için **`epoch_loss`** adında bir liste başlatılmaktadır.
+  - Grafiklerin interaktif modda çalışması sağlanmaktadır. (**`plt.ion()`**).
+
+---
+
+#### **4. Epoch Sonunda Kayıpları İzleme: `on_epoch_end`**
+- Eğitim her epoch sonunda şu işlemler yapılmaktadır:
+  - **Kayıplar ve Doğruluk Değerleri**:
+    - `g_loss`: Generator kaybı.
+    - `d_loss`: Discriminator kaybı.
+    - `d_accuracy`: Discriminator doğruluğu.
+  - **Kayıpların Saklanması**:
+    - Her epoch sonunda kayıp değerleri **`epoch_loss`** listesine eklenmektedir.
+  - **Görselleştirme**:
+    - Epoch boyunca biriken kayıp ve doğruluk değerleri bir çizgi grafikte güncellenir:
+      - Mavi çizgi: Generator kaybı.
+      - Turuncu çizgi: Discriminator kaybı.
+      - Yeşil çizgi: Discriminator doğruluğu.
+    - Grafik, her epoch sonunda güncellenerek gösterilir.
+
+---
+
+#### **5. Eğitim Sonunda Grafik Gösterimi: `on_train_end`**
+- Eğitim tamamlandığında interaktif mod kapatılır (**`plt.ioff()`**) ve final grafikler görüntülenir.
+
+---
+
+```{python, eval=FALSE}
+g_loss_history = []
+d_loss_history = []
+
+# Plotu başlangıçta bir kez oluştur
+plt.ion()
+fig, ax = plt.subplots(figsize=(8, 6))
+g_line, = ax.plot([], [], label="Generator Loss")
+d_line, = ax.plot([], [], label="Discriminator Loss")
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Loss")
+ax.set_title("Generator ve Discriminator Kayıpları")
+ax.legend()
+ax.grid(True)
+class LossHistoryCallback(tf.keras.callbacks.Callback):
+    def __init__(self):
+        super().__init__()
+        self.epoch_loss = []
+        plt.ion()
+
+    def on_epoch_end(self, epoch, logs=None):
+        g_loss = logs.get('g_loss')
+        d_loss = logs.get('d_loss')
+        d_accuracy = logs.get('d_accuracy')
+
+        if g_loss is not None and d_loss is not None:
+            self.epoch_loss.append((epoch + 1, g_loss, d_loss, d_accuracy))
+
+            # Plot the updated loss values
+            plt.figure(figsize=(10, 6))
+            epochs = [e[0] for e in self.epoch_loss]
+            g_losses = [e[1] for e in self.epoch_loss]
+            d_losses = [e[2] for e in self.epoch_loss]
+            d_accuracies = [e[3] for e in self.epoch_loss]
+
+            plt.plot(epochs, g_losses, label="Generator Loss", color="blue")
+            plt.plot(epochs, d_losses, label="Discriminator Loss", color="orange")
+            plt.plot(epochs, d_accuracies, label="Discriminator Accuracy", color="green")
+
+            plt.xlabel("Epoch")
+            plt.ylabel("Value")
+            plt.title("Training Performance")
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
+        plt.pause(0.01)
+
+    def on_train_end(self, logs=None):
+        plt.ioff()
+        plt.show()
+```
+
+### `GenerateImageCallback` Class'ı
+
+`GenerateImageCallback`, eğitim sürecinde belirli aralıklarla generator tarafından üretilen görselleri görüntülemek için bir callback sınıfıdır. Bu sınıf, TensorFlow’un `Callback` sınıfından türetilmiştir.
+
+---
+
+#### **Sınıfın Parametreleri**
+- **`generator`**: Rastgele gürültü ve koşullu etiketlerden görüntü üreten generator modeli.
+- **`label_encoder`**: Sınıf etiketlerini insan tarafından okunabilir hale dönüştürmek için kullanılan `LabelEncoder`.
+- **`latent_dim`**: Rastgele gürültü vektörünün boyutu.
+- **`num_classes`**: Sınıf sayısı (etiket çeşitliliği).
+- **`num_images`**: Her sınıf için üretilmesi istenen görüntü sayısı (varsayılan: 5).
+- **`interval`**: Görüntülerin kaç epoch'ta bir üretileceğini belirler (varsayılan: 10).
+- **`generated_images`**: Üretilen görselleri kaydetmek için kullanılan bir liste.
+
+---
+
+#### **Fonksiyonun Çalışma Adımları**
+
+##### **1. Epoch Sonunda Görsel Üretimi: `on_epoch_end`**
+- **Koşullu Üretim**: 
+  - Callback, epoch sayısının `interval` değerine bölünebilmesi durumunda çalışır (ör. her 10 epoch'ta bir).
+- **Gürültü Vektörü ve Etiketlerin Hazırlanması**:
+  - Rastgele gürültü vektörleri (`random_latent_vectors`) ve one-hot kodlanmış etiketler (`one_hot_labels`) oluşturulur.
+  - Etiketler, `to_categorical` ile one-hot formatına dönüştürülür.
+- **Görsellerin Üretilmesi**:
+  - Generator, gürültü vektörleri ve etiket bilgilerini kullanarak görüntüler üretir.
+  - Üretilen görüntüler, normalize edilerek [0, 255] aralığında uint8 formatına dönüştürülür.
+
+---
+
+##### **2. Görselleştirme**
+- **Matplotlib ile Görselleştirme**:
+  - Üretilen görseller, her sınıf için `num_images` kadar olmak üzere bir matris düzeninde (sınıflar satırlar, görüntüler sütunlar) görselleştirilir.
+  - İlk sütundaki görüntüler için sınıf etiketleri başlık olarak eklenmiştir. (`axs[label_idx, i].set_title`).
+- **Grafik Ayarları**:
+  - Tüm görseller için eksenler kapatılır (`axis("off")`).
+  - Üst başlık, epoch sayısını içerecek şekilde ayarlanır (`plt.suptitle`).
+- **Görsellerin Gösterilmesi**:
+  - Üretilen görseller interaktif olarak ekranda gösterilir (`plt.show()`).
+
+#### **Kullanım Amacı**
+- Bu sınıf, eğitim sürecinin belirli epoch'larında generator tarafından üretilen görsellerin kalitesini ve gerçekçiliğini analiz etmeyi sağlamaktadır.
+- Görseller farklı etiketlere göre üretilerek koşullu veri üretim sürecinin başarı durumu gözlemlenebilir.
+
+```{python, eval=FALSE}
+class GenerateImageCallback(tf.keras.callbacks.Callback):
+    def __init__(self, generator, label_encoder, latent_dim, num_classes, num_images=5, interval=10):
+        super().__init__()
+        self.generator = generator
+        self.label_encoder = label_encoder
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+        self.num_images = num_images
+        self.interval = interval
+        self.generated_images = []  # Görselleri kaydetmek için liste
+
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.interval == 0:  # Belirli aralıklarla görsel üret
+            fig, axs = plt.subplots(
+                self.num_classes, self.num_images,
+                figsize=(15, 15),
+                constrained_layout=True
+            )
+            for label_idx in range(self.num_classes):
+                random_latent_vectors = tf.random.normal(shape=(self.num_images, self.latent_dim))
+                one_hot_labels = tf.convert_to_tensor(
+                    to_categorical([label_idx] * self.num_images, num_classes=self.num_classes),
+                    dtype=tf.float32
+                )
+                generated_images = self.generator([random_latent_vectors, one_hot_labels])
+                generated_images = ((generated_images + 1.0) * 127.5).numpy().astype(np.uint8)  # Normalize to [0, 255]
+                
+                for i in range(self.num_images):
+                    axs[label_idx, i].imshow(generated_images[i])
+                    axs[label_idx, i].axis("off")
+                    if i == 0:
+                        axs[label_idx, i].set_title(self.label_encoder.inverse_transform([label_idx])[0])
+            plt.suptitle(f"Generated Images at Epoch {epoch + 1}")
+            plt.show()
+```
+
+### CGAN Modelinin Eğitimi
+
+CGAN modeli, eğitim sürecinde aşağıdaki ayarlar ve callback fonksiyonlarıyla çalıştırılmıştır:
+
+---
+
+#### **Eğitim Ayarları**
+- **`dataset`**: CGAN modeli üzerinde eğitilecek olan veri kümesi. Bu veri, gerçek görüntüler ve etiketlerden oluşmaktadır.
+- **`epochs`**: Modelin eğitileceği toplam epoch sayısı. Bu örnekte, eğitim tam olarak **85 epoch** sürecektir.
+
+---
+
+#### **Callback Fonksiyonları**
+Eğitim sırasında iki farklı callback fonksiyonu kullanılmıştır:
+
+1. **`LossHistoryCallback`**:
+   - Eğitim sırasında her epoch için generator ve discriminator kayıplarını (`g_loss`, `d_loss`) ve discriminator doğruluğunu (`d_accuracy`) izlemektedir.
+   - Bu metrikleri görselleştirerek kullanıcıya modelin performansını analiz etme imkanı sunmaktadır.
+
+2. **`GenerateImageCallback`**:
+   - Belirli aralıklarla (bu örnekte her epoch'ta) generator tarafından üretilen görüntüleri görselleştirir.
+   - Rastgele gürültü ve koşullu etiketlerle üretilen görseller, generator'ın eğitim sürecindeki gelişimini analiz etmek için kullanılır.
+   - Üretilen görseller sınıflara göre organize edilir ve matris düzeninde görselleştirilir.
+
+---
+
+```{python, eval=FALSE}
+cgan.fit(
+    dataset, 
+    epochs=100,  # Eğitim tam olarak 85 epoch sürecek
+    callbacks=[
+        LossHistoryCallback(), 
+        GenerateImageCallback(generator, label_encoder, latent_dim, num_classes, num_images=5, interval=1)
+    ]
+)
+```
+
+### `generate_images` Fonksiyonu
+
+Bu fonksiyon, eğitim tamamlandıktan sonra CGAN’ın **generator** modelini kullanarak belirli sınıflara ait görüntüler üretir ve görselleştirmektedir. Görseller, her sınıf için belirli sayıda üretilir ve matplotlib ile gösterilir.
+
+---
+
+#### **Fonksiyonun Parametreleri**
+- **`generator`**: Rastgele gürültü ve koşullu etiket bilgilerini kullanarak görüntü üreten modeldir.
+- **`label_encoder`**: Sınıf etiketlerini insan tarafından okunabilir hale dönüştürmek için kullanılan `LabelEncoder`.
+- **`num_images`**: Her sınıf için üretilecek görsel sayısıdır (varsayılan: 5).
+
+---
+
+#### **Fonksiyonun Çalışma Adımları**
+
+1. **Gürültü ve Etiketlerin Hazırlanması**:
+   - **Rastgele Gürültü Vektörleri**: Her sınıf için `tf.random.normal` ile `latent_dim` boyutunda rastgele gürültü vektörleri üretilmektedir.
+   - **Koşullu Etiketler**: Sınıflar, `to_categorical` fonksiyonu ile one-hot kodlanmış formata dönüştürülmektedir.
+
+2. **Görsellerin Üretilmesi**:
+   - Generator modeli, rastgele gürültü vektörlerini ve koşullu etiket bilgilerini kullanarak görüntüler üretmektedir.
+   - Üretilen görüntüler normalize edilerek [0, 255] aralığında uint8 formatına dönüştürülmektedir.
+
+3. **Görselleştirme**:
+   - Her sınıf için `num_images` kadar görsel üretilmekte ve bir satırda görselleştirilmektedir.
+   - **Başlık**: Görsellerin üst kısmında sınıf etiketleri gösterilir (`plt.title`).
+   - **Eksenlerin Kapatılması**: Görsellerin eksenleri kapatılır (`plt.axis("off")`).
+
+```{python, eval=FALSE}
+def generate_images(generator, label_encoder, num_images=5):
+    for label_idx in range(num_classes):
+        random_latent_vectors = tf.random.normal(shape=(num_images, latent_dim))
+        one_hot_labels = tf.convert_to_tensor(to_categorical([label_idx] * num_images, num_classes=num_classes), dtype=tf.float32)
+
+        generated_images = generator([random_latent_vectors, one_hot_labels])
+        generated_images = ((generated_images + 1.0) * 127.5).numpy().astype(np.uint8)  # Rescale to [0, 255]
+
+        plt.figure(figsize=(15, 15))
+        for i in range(num_images):
+            plt.subplot(1, num_images, i + 1)
+            plt.imshow(generated_images[i])
+            plt.title(label_encoder.inverse_transform([label_idx])[0])
+            plt.axis("off")
+        plt.show()
+
+# Generate and display images
+generate_images(generator, label_encoder, num_images=5)
+```
+
+![Loss Fonksiyonları](epoch.png)
+100 epoch sonunda discriminator ve generator birbiriyle rekabeti sürdürmüşlerdir. Discriminator accuracy'si %50 civarında kalmıştır. Bu da modelin 100 epoch boyunca geliştiğini göstermektedir.
+
+![98. Epoch](98.png)
+
+![100. Epoch](100.png)
+Bu iki görsel 98 ve 100. epochlardaki generate edilen görselleri göstermektedir. Modelin, 100. epoch itibariyle yüz hatlarının belirgenleşmeye başladığı gözükmüştür ancak her bir epochta arkaplandaki gürültüden çok etkilendiğini ve bu sebeple yüz hatlarını modelin öğrenme sürecinin yavaşladığı gözlemlenmiştir. Bunun önüne geçmek adına, yüz kırpıp veriyi preprocessing yapabilecek algoritmalar araştırılabilir.
